@@ -130,53 +130,62 @@ async def fetch_and_test_proxies():
     return None
 
 
-# ================= RESULT DETECTION =================
-STRICT_RESULT_MARKERS = [
+# ================= FAST RESULT DETECTION =================
+# Final result ke strong markers (yeh sirf result message mein aate hain)
+FINAL_MARKERS = [
     "QXA OSINT RESULT",
-    "Powered By QXA",
-    "Powered By QXA TEAM",
     "USER DETAILS",
     "Telegram ID  :",
     "Telegram ID :",
 ]
 
-PROCESSING_MARKERS = [
-    "⏳", "Processing...", "Processing", "Fetching",
-    "Please wait", "Please Wait", "Searching", "Loading", "⏱",
-]
-
-
+# Processing detection (sirf pehla line check — bahut strict)
 def is_processing_message(text: str) -> bool:
     if not text:
         return True
-    if any(m in text for m in STRICT_RESULT_MARKERS):
+    # Agar final marker hai -> processing NAHI
+    if any(m in text for m in FINAL_MARKERS):
         return False
-    first_line = text.strip().split("\n", 1)[0]
-    if any(m in first_line for m in PROCESSING_MARKERS):
+    stripped = text.strip()
+    # Sirf processing ka first line check karo
+    first_line = stripped.split("\n", 1)[0].strip()
+    # Exact "⏳ Processing..." ya "Processing..." 
+    if re.match(r'^[⏳⏱🔄]*\s*Processing', first_line, re.IGNORECASE):
         return True
-    if len(text) < 200 and any(m in text for m in PROCESSING_MARKERS):
-        return True
+    # Chhota message + "please wait"/"fetching"
+    if len(stripped) < 150:
+        if re.search(r'(please wait|fetching|searching|loading)', stripped, re.IGNORECASE):
+            return True
     return False
 
 
 def is_final_result(text: str) -> bool:
     if not text:
         return False
-    if any(m in text for m in STRICT_RESULT_MARKERS):
+    # Primary: strong marker
+    if any(m in text for m in FINAL_MARKERS):
         return True
+    # Fallback: processing nahi + lamba message
     if len(text) > 200 and not is_processing_message(text):
-        if "Usage:" in text and len(text) < 400:
+        low = text.lower()
+        if "usage:" in low and len(text) < 400:
             return False
-        if "will self-destruct" in text and len(text) < 400:
+        if "will self-destruct" in low and len(text) < 400:
             return False
-        if "invalid" in text.lower() and len(text) < 400:
+        if "invalid" in low and len(text) < 400:
             return False
         return True
     return False
 
 
-# ================= FETCH (FIXED) =================
-async def fetch_bot_data(full_command, target_chat, timeout=90):
+# ================= FAST FETCH =================
+async def fetch_bot_data(full_command, target_chat, timeout=30):
+    """
+    FAST fetch:
+    - Handler send se PEHLE register
+    - Pehli final message pe turant return (usually 3-5s)
+    - Timeout sirf safety ke liye (30s)
+    """
     try:
         if not client.is_connected():
             await client.connect()
@@ -184,26 +193,29 @@ async def fetch_bot_data(full_command, target_chat, timeout=90):
         try:
             entity = await client.get_entity(target_chat)
         except Exception as e:
-            print(f"❌ Cannot resolve '{target_chat}': {e}")
-            return {"error": f"Cannot resolve chat '{target_chat}' - {e}"}
+            return {"error": f"Cannot resolve '{target_chat}': {e}"}
 
         chat_id = entity.id
         entity_id = entity.id
         print(f"✅ Resolved '{target_chat}' -> id={chat_id}")
 
-        final_text = None
-        collected = []
+        result_event = asyncio.Event()
+        final_text = [None]
         send_time = [None]
 
+        # ✅ Handler PEHLE register (race khatam)
         @client.on(events.NewMessage())
         async def handler(event):
-            nonlocal final_text
             if event.message.out:
                 return
+            if final_text[0]:  # already got result
+                return
+
             text = event.message.text or ""
             if not text:
                 return
 
+            # Match chat ya sender
             chat_match = (event.chat_id == chat_id) or (event.chat_id == -chat_id)
             sender_match = False
             try:
@@ -212,10 +224,10 @@ async def fetch_bot_data(full_command, target_chat, timeout=90):
                     sender_match = True
             except Exception:
                 pass
-
             if not (chat_match or sender_match):
                 return
 
+            # Ignore purane messages
             if send_time[0] and event.message.date:
                 try:
                     if event.message.date.timestamp() < send_time[0] - 2:
@@ -223,18 +235,17 @@ async def fetch_bot_data(full_command, target_chat, timeout=90):
                 except Exception:
                     pass
 
-            preview = text[:120].replace("\n", " ")
+            preview = text[:100].replace("\n", " ")
             print(f"📩 Incoming (id={event.message.id}, len={len(text)}): {preview}")
-            collected.append((len(text), text))
 
             if is_final_result(text):
-                final_text = text
-                print(f"✅ Final captured ({len(text)} chars)")
+                final_text[0] = text
+                print(f"✅ Final captured ({len(text)} chars) — returning NOW")
+                result_event.set()
             elif is_processing_message(text):
-                print("⏳ Skipped processing")
+                print("⏳ Processing — waiting for final")
 
-        await asyncio.sleep(0.5)
-
+        # ✅ Send command
         sent_msg = await client.send_message(entity, full_command)
         try:
             send_time[0] = sent_msg.date.timestamp()
@@ -242,26 +253,17 @@ async def fetch_bot_data(full_command, target_chat, timeout=90):
             send_time[0] = time.time()
         print(f"📤 Sent '{full_command}' (msg_id={sent_msg.id})")
 
-        start_time = time.time()
-        last_log = -1
-        while time.time() - start_time < timeout:
-            if final_text:
-                break
-            elapsed = int(time.time() - start_time)
-            if elapsed > 0 and elapsed % 10 == 0 and elapsed != last_log:
-                print(f"⏱️  Waiting... {elapsed}s / {timeout}s")
-                last_log = elapsed
-            await asyncio.sleep(0.4)
+        # ✅ Wait for event — jaise hi final aaye turant return
+        try:
+            await asyncio.wait_for(result_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            print(f"⏱️ Timeout {timeout}s — no final result")
 
         client.remove_event_handler(handler)
 
-        if final_text:
-            return {"text": final_text, "success": True}
-        if collected:
-            collected.sort(key=lambda x: x[0], reverse=True)
-            best = collected[0][1]
-            print(f"⚠️ Timeout, returning best ({len(best)} chars)")
-            return {"text": best, "success": True, "fallback": True}
+        if final_text[0]:
+            return {"text": final_text[0], "success": True}
+
         return {"error": f"Timeout: No final result in {timeout}s"}
 
     except Exception as e:
@@ -271,26 +273,52 @@ async def fetch_bot_data(full_command, target_chat, timeout=90):
         return {"error": str(e)}
 
 
-# ================= JSON PARSER =================
+# ================= CLEAN JSON PARSER (Hide Source) =================
 def clean_val(v):
     if not v:
         return None
     v = v.strip()
-    # strip emojis/flag at end
-    v = re.sub(r'[\U0001F1E6-\U0001F1FF\u2600-\u27BF\uD83C-\uDBFF\uDC00-\uDFFF]+$', '', v).strip()
+    # Emoji/flag strip
+    v = re.sub(r'[\U0001F1E6-\U0001F1FF\u2600-\u27BF\uD83C-\uDBFF\uDC00-\uDFFF]+', '', v).strip()
+    v = re.sub(r'\s{2,}', ' ', v).strip()
     if v.lower() in ("not available", "n/a", "none", "null", "-", ""):
         return None
     return v
 
 
-def parse_osint_result(raw_text: str) -> dict:
+# Keys jinko API response mein show NAHI karna (hide source & branding)
+HIDDEN_KEYS = {
+    "source", "powered_by", "powered by qxa", "powered by qxa team",
+    "database", "qxa database", "source_", "_source",
+}
+
+# Lines jinko skip karna (branding, separators)
+SKIP_LINE_PATTERNS = [
+    r'^━+$', r'^─+$', r'^=+$', r'^-+$',
+    r'powered\s*by', r'qxa\s*team', r'qxa\s*database',
+    r'^source\s*:', r'^database\s*:',
+    r'qxa\s*osint\s*result',
+    r'✈️\s*telegram\s*lookup',
+    r'👤\s*user\s*details',
+    r'🗄️',
+    r'🔥\s*powered',
+]
+
+
+def should_skip_line(line: str) -> bool:
+    low = line.strip().lower()
+    for pat in SKIP_LINE_PATTERNS:
+        if re.search(pat, low):
+            return True
+    return False
+
+
+def parse_osint_result(raw_text: str, hide_meta: bool = True) -> dict:
     """
-    Saara data structured JSON mein organize karo.
+    Clean structured JSON — source/branding hidden.
     """
-    data = {
-        "raw": raw_text,
+    result = {
         "success": True,
-        "source": "QXA OSINT",
         "sections": {
             "telegram": {},
             "identity": {},
@@ -305,17 +333,14 @@ def parse_osint_result(raw_text: str) -> dict:
     }
 
     if not raw_text:
-        data["success"] = False
-        return data
+        result["success"] = False
+        return result
 
-    # ---------- Individual field regex ----------
+    # ---------- Field regex ----------
     fields = {
-        # Telegram
         "telegram_id":   (r'(?:Telegram\s*ID|ᴛᴇʟᴇɢraᴍ\s*ɪᴅ)\s*:?\s*(\d+)', "telegram"),
         "username":      (r'Username\s*:?\s*@?([A-Za-z0-9_]{3,})', "telegram"),
-        "tg_name":       (r'Telegram\s*Name\s*:?\s*([^\n]+)', "telegram"),
 
-        # Identity
         "name":          (r'(?<!Telegram )(?<!Father )Name\s*:?\s*([^\n]+)', "identity"),
         "father_name":   (r'(?:Father(?:\'s)?\s*Name|पिता)\s*:?\s*([^\n]+)', "identity"),
         "mother_name":   (r'(?:Mother(?:\'s)?\s*Name|माता)\s*:?\s*([^\n]+)', "identity"),
@@ -323,7 +348,6 @@ def parse_osint_result(raw_text: str) -> dict:
         "dob":           (r'(?:DOB|Date\s*of\s*Birth)\s*:?\s*([^\n]+)', "identity"),
         "age":           (r'Age\s*:?\s*(\d+)', "identity"),
 
-        # Contact
         "mobile":        (r'(?:Mobile|Phone|Contact)\s*:?\s*(\+?[\d\s\(\)\-]{8,})', "contact"),
         "alt_mobile":    (r'(?:Alternate|Alt)\s*(?:Mobile|Phone)\s*:?\s*(\+?[\d\s\(\)\-]{8,})', "contact"),
         "email":         (r'Email\s*:?\s*([^\s\n]+@[^\s\n]+)', "contact"),
@@ -332,37 +356,24 @@ def parse_osint_result(raw_text: str) -> dict:
         "city":          (r'City\s*:?\s*([^\n]+)', "contact"),
         "pincode":       (r'(?:Pin\s*code|Pincode|PIN)\s*:?\s*(\d{6})', "contact"),
 
-        # Documents
         "aadhaar":       (r'Aadhaar(?:\s*Number)?\s*:?\s*(\d{12})', "documents"),
         "pan":           (r'PAN(?:\s*Number)?\s*:?\s*([A-Z]{5}\d{4}[A-Z])', "documents"),
         "voter_id":      (r'(?:Voter|EPIC)\s*(?:ID)?\s*:?\s*([A-Z]{3}\d{7})', "documents"),
         "dl":            (r'(?:DL|Driving\s*License)\s*:?\s*([A-Z0-9\-]{10,20})', "documents"),
-        "passport":      (r'Passport\s*:?\s*([A-Z][0-9]{7})', "documents"),
 
-        # Location
-        "address":       (r'Address\s*:?\s*([^\n]+(?:\n[^\n]+)*?)(?=\n[━━🗄🔥]|\n[A-Z][a-z]+\s*:|$)', "location"),
+        "address":       (r'Address\s*:?\s*([^\n]+(?:\n[^\n]+)*?)(?=\n[━🗄🔥]|\n[A-Z][a-z]+\s*:|$)', "location"),
         "district":      (r'District\s*:?\s*([^\n]+)', "location"),
 
-        # Social
         "instagram":     (r'Instagram\s*:?\s*@?([A-Za-z0-9_.]{3,})', "social"),
         "facebook":      (r'Facebook\s*:?\s*@?([A-Za-z0-9_.]{3,})', "social"),
         "twitter":       (r'(?:Twitter|X)\s*:?\s*@?([A-Za-z0-9_]{3,})', "social"),
         "github":        (r'GitHub\s*:?\s*@?([A-Za-z0-9\-]{3,})', "social"),
-        "snapchat":      (r'Snapchat\s*:?\s*@?([A-Za-z0-9_.]{3,})', "social"),
 
-        # Finance
         "upi":           (r'UPI(?:\s*ID)?\s*:?\s*([^\s\n]+@[^\s\n]+)', "finance"),
         "bank":          (r'Bank(?:\s*Name)?\s*:?\s*([^\n]+)', "finance"),
         "ifsc":          (r'IFSC\s*:?\s*([A-Z]{4}0[A-Z0-9]{6})', "finance"),
-        "account":       (r'(?:Account|A/C)\s*(?:Number)?\s*:?\s*(\d{9,18})', "finance"),
 
-        # Vehicle
         "vehicle":       (r'(?:Vehicle|RC)\s*(?:Number)?\s*:?\s*([A-Z]{2}\d{1,2}[A-Z]{1,2}\d{4})', "vehicle"),
-        "vehicle_model": (r'Vehicle\s*Model\s*:?\s*([^\n]+)', "vehicle"),
-
-        # Other / source
-        "source":        (r'(?:Source)\s*:?\s*([^\n]+)', "other"),
-        "ip":            (r'\b((?:\d{1,3}\.){3}\d{1,3})\b', "other"),
     }
 
     for key, (pat, section) in fields.items():
@@ -370,55 +381,50 @@ def parse_osint_result(raw_text: str) -> dict:
         if m:
             val = clean_val(m.group(1))
             if val:
-                data["sections"][section][key] = val
+                result["sections"][section][key] = val
 
-    # ---------- Embedded JSON extraction ----------
-    # Try to find any JSON blob inside raw (bot might return JSON)
-    json_match = re.search(r'\{[\s\S]{20,}\}', raw_text)
-    if json_match:
-        try:
-            embedded = json.loads(json_match.group(0))
-            data["embedded_json"] = embedded
-        except Exception:
-            pass
-
-    # ---------- Auto-classify remaining lines ----------
-    # Any "Key: Value" line not already parsed → "other" section
+    # ---------- Remaining "Key: Value" lines (skip source/branding) ----------
     for line in raw_text.splitlines():
         line = line.strip()
         if not line or ":" not in line:
             continue
-        # Skip separator lines
-        if re.match(r'^[━─=\-_]{3,}$', line):
+        if should_skip_line(line):
             continue
-        # "Key : Value" pattern
+
         m = re.match(r'^([A-Za-z][A-Za-z0-9 _/\-]{1,40})\s*:\s*(.+)$', line)
         if not m:
             continue
-        k = m.group(1).strip().lower().replace(" ", "_")
+
+        raw_key = m.group(1).strip()
+        k = raw_key.lower().replace(" ", "_").replace("-", "_")
         v = clean_val(m.group(2))
+
         if not v:
             continue
-        # Skip if key already exists somewhere in sections
+        if k in HIDDEN_KEYS:
+            continue
+        if hide_meta and ("source" in k or "powered" in k or k == "database"):
+            continue
+
+        # Skip if already captured
         already = False
-        for sec in data["sections"].values():
+        for sec in result["sections"].values():
             if k in sec:
                 already = True
                 break
         if not already:
-            data["sections"]["other"][k] = v
+            result["sections"]["other"][k] = v
 
-    # ---------- Remove empty sections ----------
-    data["sections"] = {k: v for k, v in data["sections"].items() if v}
+    # ---------- Clean empty sections ----------
+    result["sections"] = {k: v for k, v in result["sections"].items() if v}
 
     # ---------- Flat view ----------
     flat = {}
-    for sec_name, sec_data in data["sections"].items():
-        for k, v in sec_data.items():
-            flat[k] = v
-    data["flat"] = flat
+    for sec_data in result["sections"].values():
+        flat.update(sec_data)
+    result["flat"] = flat
 
-    return data
+    return result
 
 
 # ================= HTML =================
@@ -457,7 +463,7 @@ footer{text-align:center;padding:30px 0;color:#64748b;font-size:0.85rem;border-t
 <div class="status">● API Online</div>
 </header>
 <div class="note">
-💡 <b>Tip:</b> Add <code>&amp;hidden=true</code> to hide raw + only structured data.
+💡 <b>Tip:</b> Add <code>&amp;hidden=true</code> to hide raw text (source auto-hidden).
 </div>
 <h2>📋 Endpoints</h2>
 <div class="grid" id="endpoints"></div>
@@ -556,12 +562,13 @@ def dynamic_command(full_path):
 
     full_command = f"/{command} {value}".strip()
 
+    # ✅ 30s timeout (bot normally 3-5s mein reply deta hai)
     future = asyncio.run_coroutine_threadsafe(
-        fetch_bot_data(full_command, target_chat, timeout=90),
+        fetch_bot_data(full_command, target_chat, timeout=30),
         telethon_loop
     )
     try:
-        fetched = future.result(timeout=100)
+        fetched = future.result(timeout=35)
     except TimeoutError:
         return jsonify({"success": False, "error": "Request Timeout"}), 504
     except Exception as e:
@@ -575,22 +582,19 @@ def dynamic_command(full_path):
         }), 400
 
     raw_result = fetched["text"]
-    parsed = parse_osint_result(raw_result)
+    parsed = parse_osint_result(raw_result, hide_meta=True)
 
-    # ---------- Base response ----------
+    # ✅ Clean response (source/branding hidden)
     response = {
         "success": True,
         "command": full_command,
-        "target": "Group" if target_chat == GROUP_ID else "Bot",
-        "fallback_used": fetched.get("fallback", False),
-        "data": parsed["sections"],   # nested structured data
-        "flat": parsed["flat"],       # flat key->value map
+        "data": parsed["sections"],
+        "flat": parsed["flat"],
     }
 
+    # Raw sirf hidden=false pe
     if not hidden_only:
         response["raw"] = raw_result
-        if "embedded_json" in parsed:
-            response["embedded_json"] = parsed["embedded_json"]
 
     return jsonify(response)
 
@@ -600,9 +604,7 @@ def health():
     return jsonify({
         "success": True,
         "status": "ok",
-        "bot": BOT_USERNAME,
         "telethon_connected": telethon_loop is not None and telethon_loop.is_running(),
-        "active_proxy": active_proxy
     })
 
 
@@ -614,7 +616,7 @@ def debug_tg(target):
         return jsonify({"success": False, "error": "Telethon not running"}), 500
     future = asyncio.run_coroutine_threadsafe(_debug_fetch(target), telethon_loop)
     try:
-        return jsonify(future.result(timeout=90))
+        return jsonify(future.result(timeout=40))
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -624,12 +626,8 @@ async def _debug_fetch(target):
     try:
         if not client.is_connected():
             await client.connect()
-        try:
-            bot_entity = await client.get_entity(BOT_USERNAME)
-            logs.append({"step": "resolve", "ok": True, "id": bot_entity.id})
-        except Exception as e:
-            logs.append({"step": "resolve", "ok": False, "error": str(e)})
-            return {"success": False, "logs": logs}
+        bot_entity = await client.get_entity(BOT_USERNAME)
+        logs.append({"step": "resolve", "ok": True, "id": bot_entity.id})
 
         sent = await client.send_message(bot_entity, f"/tg {target}")
         logs.append({"step": "send", "ok": True, "msg_id": sent.id})
@@ -653,11 +651,15 @@ async def _debug_fetch(target):
                 "len": len(text),
                 "preview": text[:300],
                 "is_processing": is_processing_message(text),
-                "is_final": is_final_result(text)
+                "is_final": is_final_result(text),
+                "elapsed_s": round(time.time() - start, 2)
             })
 
-        while time.time() - start < 60:
-            await asyncio.sleep(0.5)
+        while time.time() - start < 20:
+            # Early exit if final received
+            if any(r["is_final"] for r in received):
+                break
+            await asyncio.sleep(0.3)
 
         client.remove_event_handler(handler)
         return {"success": True, "logs": logs, "received": received, "count": len(received)}
