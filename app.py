@@ -27,10 +27,10 @@ except ValueError:
 client = None
 telethon_loop = None
 active_proxy = None
-bot_entity_id = None
 
-# ================= GLOBAL STATE FOR LISTENER =================
-pending_requests = {}  # {message_id: {"event": asyncio.Event(), "text": None, "done": False}}
+# ================= GLOBAL STATE =================
+# Mapping: original_sent_message_id -> {"event": asyncio.Event(), "text": None}
+pending_requests = {}
 
 # ================= PROXY =================
 PROXY_SOURCES = [
@@ -110,7 +110,7 @@ async def fetch_and_test_proxies():
         return active_proxy
     return None
 
-# ================= FAST RESULT DETECTION =================
+# ================= RESULT DETECTION =================
 FINAL_MARKERS = [
     "QXA OSINT RESULT",
     "USER DETAILS",
@@ -118,115 +118,70 @@ FINAL_MARKERS = [
     "Telegram ID :",
 ]
 
-def is_processing_message(text: str) -> bool:
-    if not text: return True
-    if any(m in text for m in FINAL_MARKERS): return False
-    first_line = text.strip().split("\n", 1)[0].strip()
-    if re.match(r'^[⏳⏱🔄]*\s*Processing', first_line, re.IGNORECASE): return True
-    if len(text) < 150 and re.search(r'(please wait|fetching|searching|loading)', text, re.IGNORECASE): return True
-    return False
-
 def is_final_result(text: str) -> bool:
     if not text: return False
+    # Direct marker match
     if any(m in text for m in FINAL_MARKERS): return True
-    if len(text) > 200 and not is_processing_message(text):
+    # Agar 200 characters se bada hai aur koi processing word nahi hai
+    if len(text) > 200:
         low = text.lower()
+        if any(x in low for x in ["please wait", "fetching", "searching", "loading", "processing"]): return False
         if "usage:" in low and len(text) < 400: return False
-        if "will self-destruct" in low and len(text) < 400: return False
-        if "invalid" in low and len(text) < 400: return False
         return True
     return False
 
-# ================= GLOBAL BOT LISTENER =================
-async def global_bot_listener(event):
-    global bot_entity_id
-    if not event.message or event.message.out:
-        return
-    
-    text = event.message.text or ""
-    if not text:
-        return
-
-    # Verify the sender is the bot
-    try:
-        sender = await event.get_sender()
-        if not sender or getattr(sender, "id", None) != bot_entity_id:
-            return
-    except Exception:
-        return
-
-    # Check if this is a response to any of our pending requests
-    # We use the reply_to_msg_id or just match the most recent pending request
-    for req_id, data in list(pending_requests.items()):
-        if data["done"]:
-            continue
-        
-        # If it's a processing message, we ignore it and keep waiting
-        if is_processing_message(text):
-            continue
-            
-        if is_final_result(text):
-            data["text"] = text
-            data["done"] = True
-            data["event"].set()
-            break # Stop checking other pending requests
-
 # ================= FAST FETCH =================
 async def fetch_bot_data(full_command, target_chat, timeout=30):
-    global bot_entity_id
     try:
         if not client.is_connected():
             await client.connect()
 
         try:
             entity = await client.get_entity(target_chat)
-            bot_entity_id = entity.id
         except Exception as e:
             return {"error": f"Cannot resolve '{target_chat}': {e}"}
 
-        # Create a unique ID for this request
-        req_id = str(time.time()) + "_" + str(random.randint(1000, 9999))
-        pending_requests[req_id] = {
-            "event": asyncio.Event(),
-            "text": None,
-            "done": False
-        }
-
-        # Send the command
+        # 1. Send the command
+        print(f"📤 Sending command: {full_command}")
         sent_msg = await client.send_message(entity, full_command)
         
-        # Wait for the global listener to catch the reply
-        try:
-            await asyncio.wait_for(pending_requests[req_id]["event"].wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            pass
+        # 2. Save the Message ID
+        req_id = sent_msg.id
+        pending_requests[req_id] = {"event": asyncio.Event(), "text": None}
+        print(f"⏳ Waiting for reply to message ID: {req_id}")
 
-        # Cleanup
-        req_data = pending_requests.pop(req_id, None)
-        
-        if req_data and req_data["text"]:
-            return {"text": req_data["text"], "success": True}
-        
+        # 3. Background Polling Loop (Har 1 second check karega)
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            # Fetch last few messages
+            messages = await client.get_messages(entity, limit=5)
+            
+            for msg in messages:
+                # Check if it's a reply to our message OR if it's from the bot
+                if msg.reply_to_msg_id == req_id or msg.sender_id == entity.id:
+                    txt = msg.text or ""
+                    if is_final_result(txt):
+                        print(f"✅ Final result caught via polling!")
+                        pending_requests.pop(req_id, None)
+                        return {"text": txt, "success": True}
+            
+            await asyncio.sleep(1)
+
+        # 4. Timeout cleanup
+        pending_requests.pop(req_id, None)
         return {"error": f"Timeout: No final result in {timeout}s"}
 
     except Exception as e:
         return {"error": str(e)}
 
-# ================= CLEAN JSON PARSER (Premium Emoji Fix) =================
+# ================= CLEAN JSON PARSER =================
 def clean_val(v):
     if not v: return None
     v = v.strip()
-    
-    # 1. Remove Standard and Premium Custom Emojis / Flags
     v = re.sub(r'[\U00010000-\U0010FFFF]', '', v) 
     v = re.sub(r'[\U0001F1E6-\U0001F1FF\u2600-\u27BF\uD83C-\uDBFF\uDC00-\uDFFF]', '', v) 
-    
-    # 2. Remove weird spaces and replace with single space
     v = re.sub(r'\s{2,}', ' ', v).strip()
-    
-    # 3. Remove brackets if any left empty e.g. "()"
     v = re.sub(r'\(\s*\)', '', v).strip()
-    
     if v.lower() in ("not available", "n/a", "none", "null", "-", ""): return None
     return v
 
@@ -461,7 +416,7 @@ def health():
 
 # ================= TELETHON THREAD =================
 def start_telethon():
-    global telethon_loop, client, bot_entity_id
+    global telethon_loop, client
     telethon_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(telethon_loop)
 
@@ -483,11 +438,8 @@ def start_telethon():
         if not telethon_loop.run_until_complete(client.is_user_authorized()):
             print("❌ User not authorized. Check SESSION_STRING.")
             return
-            
-        # Register the global listener ONCE at startup
-        client.add_event_handler(global_bot_listener, events.NewMessage())
-        print("✅ Global Bot Listener Registered.")
 
+        print(f"✅ Telethon connected. Logged in as {BOT_USERNAME} target.")
         telethon_loop.run_forever()
     except Exception as e:
         print(f"❌ Telethon Start Error: {e}")
@@ -496,5 +448,5 @@ if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     t = threading.Thread(target=start_telethon, daemon=True)
     t.start()
-    time.sleep(5) # Reduced from 10s, 5s is enough for proxy test
+    time.sleep(5)
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
