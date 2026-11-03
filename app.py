@@ -12,7 +12,7 @@ from telethon.sessions import StringSession
 
 app = Flask(__name__)
 
-# ================= CONFIG (Render Env Variables) =================
+# ================= CONFIG =================
 API_ID = int(os.environ.get("API_ID", 23941289))
 API_HASH = os.environ.get("API_HASH", "591fff002ba2c3b3f6abda1f92d73330")
 SESSION_STRING = os.environ.get("SESSION_STRING", "1BJWap1sBu6zJEgjKWRCn_IyZnLH18wsnENZzd8pwpXBHUJ9I67SWlM8KqzRwh-C6fKSq5vULcuGWx1QUe29n-OX7pJ9ASWFY1O9FqiDO4Z0_3yp0ygr8x8Oqh5B-pXolK5idfo9LHb4VPQXC0dcTRiZKziXdSSvepeBJDY2W94neZXznsWhT6GpUC8vcAhn2-D49X5vVQYc3vvLth3laS3Buxl0q3U0ZzUYi6M7Ocp4sb6XRXaDpr-wvnlTmmwaat2g0OhlOkLzrPsdJGLmi6KKzdx6OvAUx_KHyWeOH8eNbTdH3BVkW7VCSzHDVM1SbLDZbKy_iByzB5ilO9Xg5G5h_XesZcUA=")
@@ -28,7 +28,7 @@ client = None
 telethon_loop = None
 active_proxy = None
 
-# ================= PROXY FETCHER =================
+# ================= PROXY =================
 PROXY_SOURCES = [
     "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
     "https://api.proxyscrape.com/v4/free-proxy-list/get?request=displayproxies&protocol=http&timeout=10000",
@@ -52,8 +52,7 @@ async def fetch_source(session, url, result_set):
                 return
             text = await resp.text(errors='ignore')
             if '<html' in text.lower() or '<body' in text.lower():
-                matches = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}:\d+\b', text)
-                for m in matches:
+                for m in re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}:\d+\b', text):
                     result_set.add(m)
             else:
                 if text.strip().startswith('{') or text.strip().startswith('['):
@@ -118,7 +117,6 @@ async def fetch_and_test_proxies():
     if not valid:
         return None
 
-    working = []
     async with aiohttp.ClientSession() as session:
         chunk = valid[:100]
         results = await asyncio.gather(*[test_single_proxy(session, p) for p in chunk], return_exceptions=True)
@@ -132,192 +130,298 @@ async def fetch_and_test_proxies():
     return None
 
 
-# ================= PROCESSING / RESULT DETECTION =================
-# QXA bot ka processing message: "⏳ **Processing...**" + "Fetching ..."
-# Final result: "🔥 QXA OSINT RESULT" ... "Powered By QXA TEAM"
-
-RESULT_MARKERS = [
+# ================= RESULT DETECTION =================
+STRICT_RESULT_MARKERS = [
     "QXA OSINT RESULT",
-    "USER DETAILS",
     "Powered By QXA",
     "Powered By QXA TEAM",
-    "Source      :",
-    "Source :",
-    "Telegram ID",
-    "ᴛᴇʟᴇɢraᴍ ɪᴅ",
+    "USER DETAILS",
+    "Telegram ID  :",
+    "Telegram ID :",
 ]
 
 PROCESSING_MARKERS = [
-    "⏳",
-    "Processing...",
-    "Processing",
-    "Fetching",
-    "Please wait",
-    "Please Wait",
-    "Searching",
-    "Loading",
+    "⏳", "Processing...", "Processing", "Fetching",
+    "Please wait", "Please Wait", "Searching", "Loading", "⏱",
 ]
 
 
 def is_processing_message(text: str) -> bool:
     if not text:
         return True
-    # Agar result markers hain toh processing NAHI hai
-    if any(m in text for m in RESULT_MARKERS):
+    if any(m in text for m in STRICT_RESULT_MARKERS):
         return False
-    # Sirf tab processing jab short message ho aur processing keyword ho
-    if len(text) < 350:
-        return any(m in text for m in PROCESSING_MARKERS)
+    first_line = text.strip().split("\n", 1)[0]
+    if any(m in first_line for m in PROCESSING_MARKERS):
+        return True
+    if len(text) < 200 and any(m in text for m in PROCESSING_MARKERS):
+        return True
     return False
 
 
 def is_final_result(text: str) -> bool:
     if not text:
         return False
-    if any(m in text for m in RESULT_MARKERS):
+    if any(m in text for m in STRICT_RESULT_MARKERS):
         return True
-    # Fallback: agar lamba message hai aur processing nahi hai
-    if len(text) > 150 and not is_processing_message(text):
-        # Lekin usage/error messages ko ignore karo
-        if "Usage:" in text and len(text) < 300:
+    if len(text) > 200 and not is_processing_message(text):
+        if "Usage:" in text and len(text) < 400:
             return False
-        if "will self-destruct" in text and len(text) < 300:
+        if "will self-destruct" in text and len(text) < 400:
+            return False
+        if "invalid" in text.lower() and len(text) < 400:
             return False
         return True
     return False
 
 
-# ================= TELETHON BOT LOGIC =================
-async def fetch_bot_data(full_command, target_chat, timeout=45):
-    """
-    GUARANTEED fetch:
-    1. Entity resolve (string -> object)
-    2. Send command
-    3. Listen for reply on resolved chat_id
-    4. Return final result text
-    """
+# ================= FETCH (FIXED) =================
+async def fetch_bot_data(full_command, target_chat, timeout=90):
     try:
         if not client.is_connected():
             await client.connect()
 
-        # ✅ STEP 1: Entity resolve
         try:
             entity = await client.get_entity(target_chat)
         except Exception as e:
-            print(f"❌ Cannot resolve chat '{target_chat}': {e}")
-            return f"Error: Cannot resolve chat '{target_chat}' - {e}"
+            print(f"❌ Cannot resolve '{target_chat}': {e}")
+            return {"error": f"Cannot resolve chat '{target_chat}' - {e}"}
 
         chat_id = entity.id
+        entity_id = entity.id
         print(f"✅ Resolved '{target_chat}' -> id={chat_id}")
 
-        # ✅ STEP 2: Send command
-        sent_msg = await client.send_message(entity, full_command)
-        sent_id = sent_msg.id
-        print(f"📤 Sent '{full_command}' (msg_id={sent_id})")
-
         final_text = None
-        start_time = time.time()
-        messages_seen = []
+        collected = []
+        send_time = [None]
 
-        # ✅ STEP 3: Handler on resolved chat_id
-        @client.on(events.NewMessage(chats=chat_id))
+        @client.on(events.NewMessage())
         async def handler(event):
             nonlocal final_text
-            if final_text:
-                return
             if event.message.out:
                 return
-
             text = event.message.text or ""
             if not text:
                 return
 
-            preview = text[:100].replace("\n", " ")
-            print(f"📩 Incoming (id={event.message.id}, len={len(text)}): {preview}")
+            chat_match = (event.chat_id == chat_id) or (event.chat_id == -chat_id)
+            sender_match = False
+            try:
+                sender = await event.get_sender()
+                if sender and getattr(sender, "id", None) == entity_id:
+                    sender_match = True
+            except Exception:
+                pass
 
-            # Skip processing
-            if is_processing_message(text) and not is_final_result(text):
-                print(f"⏳ Skipped processing message")
+            if not (chat_match or sender_match):
                 return
 
-            # Capture final result
+            if send_time[0] and event.message.date:
+                try:
+                    if event.message.date.timestamp() < send_time[0] - 2:
+                        return
+                except Exception:
+                    pass
+
+            preview = text[:120].replace("\n", " ")
+            print(f"📩 Incoming (id={event.message.id}, len={len(text)}): {preview}")
+            collected.append((len(text), text))
+
             if is_final_result(text):
                 final_text = text
-                print(f"✅ Final result captured ({len(text)} chars)")
-                return
+                print(f"✅ Final captured ({len(text)} chars)")
+            elif is_processing_message(text):
+                print("⏳ Skipped processing")
 
-        # Handler register hone ka thoda wait
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(0.5)
 
-        # ✅ STEP 4: Wait for result
+        sent_msg = await client.send_message(entity, full_command)
+        try:
+            send_time[0] = sent_msg.date.timestamp()
+        except Exception:
+            send_time[0] = time.time()
+        print(f"📤 Sent '{full_command}' (msg_id={sent_msg.id})")
+
+        start_time = time.time()
         last_log = -1
         while time.time() - start_time < timeout:
             if final_text:
                 break
             elapsed = int(time.time() - start_time)
             if elapsed > 0 and elapsed % 10 == 0 and elapsed != last_log:
-                print(f"⏱️  Waiting... {elapsed}s / {timeout}s elapsed")
+                print(f"⏱️  Waiting... {elapsed}s / {timeout}s")
                 last_log = elapsed
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.4)
 
         client.remove_event_handler(handler)
 
         if final_text:
-            return final_text
-        return f"Timeout: No final result in {timeout}s"
+            return {"text": final_text, "success": True}
+        if collected:
+            collected.sort(key=lambda x: x[0], reverse=True)
+            best = collected[0][1]
+            print(f"⚠️ Timeout, returning best ({len(best)} chars)")
+            return {"text": best, "success": True, "fallback": True}
+        return {"error": f"Timeout: No final result in {timeout}s"}
 
     except Exception as e:
         print(f"❌ fetch_bot_data error: {e}")
         import traceback
         traceback.print_exc()
-        return f"Error: {str(e)}"
+        return {"error": str(e)}
 
 
-# ================= RESULT PARSER =================
+# ================= JSON PARSER =================
+def clean_val(v):
+    if not v:
+        return None
+    v = v.strip()
+    # strip emojis/flag at end
+    v = re.sub(r'[\U0001F1E6-\U0001F1FF\u2600-\u27BF\uD83C-\uDBFF\uDC00-\uDFFF]+$', '', v).strip()
+    if v.lower() in ("not available", "n/a", "none", "null", "-", ""):
+        return None
+    return v
+
+
 def parse_osint_result(raw_text: str) -> dict:
-    """Raw Telegram text se structured JSON banao."""
-    result = {"raw": raw_text, "parsed": {}}
-
-    # Extract fields via regex
-    patterns = {
-        "telegram_id": r'(?:Telegram ID|ᴛᴇʟᴇɢraᴍ ɪᴅ)\s*:?\s*(\d+)',
-        "name": r'Name\s*:?\s*([^\n]+)',
-        "mobile": r'Mobile\s*:?\s*([+\d\s\(\)\-🇮🇳🇵🇰]+)',
-        "country": r'Country\s*:?\s*([^\n]+)',
-        "source": r'Source\s*:?\s*([^\n]+)',
-        "aadhaar": r'Aadhaar\s*(?:Number)?\s*:?\s*(\d{12})',
-        "pan": r'PAN\s*(?:Number)?\s*:?\s*([A-Z]{5}\d{4}[A-Z])',
-        "email": r'Email\s*:?\s*([^\s\n]+@[^\s\n]+)',
-        "vehicle": r'(?:Vehicle|RC)\s*(?:Number)?\s*:?\s*([A-Z]{2}\d{1,2}[A-Z]{1,2}\d{4})',
-        "upi": r'UPI\s*(?:ID)?\s*:?\s*([^\s\n]+@[^\s\n]+)',
-        "address": r'Address\s*:?\s*([^\n]+(?:\n[^\n]+)*?)(?=\n[━━🗄🔥]|$)',
-        "father_name": r'(?:Father|पिता)\s*(?:Name)?\s*:?\s*([^\n]+)',
-        "dob": r'(?:DOB|Date of Birth)\s*:?\s*([^\n]+)',
-        "gender": r'Gender\s*:?\s*([^\n]+)',
+    """
+    Saara data structured JSON mein organize karo.
+    """
+    data = {
+        "raw": raw_text,
+        "success": True,
+        "source": "QXA OSINT",
+        "sections": {
+            "telegram": {},
+            "identity": {},
+            "contact": {},
+            "documents": {},
+            "location": {},
+            "social": {},
+            "finance": {},
+            "vehicle": {},
+            "other": {}
+        }
     }
 
-    parsed = {}
-    for key, pattern in patterns.items():
-        m = re.search(pattern, raw_text, re.IGNORECASE)
+    if not raw_text:
+        data["success"] = False
+        return data
+
+    # ---------- Individual field regex ----------
+    fields = {
+        # Telegram
+        "telegram_id":   (r'(?:Telegram\s*ID|ᴛᴇʟᴇɢraᴍ\s*ɪᴅ)\s*:?\s*(\d+)', "telegram"),
+        "username":      (r'Username\s*:?\s*@?([A-Za-z0-9_]{3,})', "telegram"),
+        "tg_name":       (r'Telegram\s*Name\s*:?\s*([^\n]+)', "telegram"),
+
+        # Identity
+        "name":          (r'(?<!Telegram )(?<!Father )Name\s*:?\s*([^\n]+)', "identity"),
+        "father_name":   (r'(?:Father(?:\'s)?\s*Name|पिता)\s*:?\s*([^\n]+)', "identity"),
+        "mother_name":   (r'(?:Mother(?:\'s)?\s*Name|माता)\s*:?\s*([^\n]+)', "identity"),
+        "gender":        (r'Gender\s*:?\s*([^\n]+)', "identity"),
+        "dob":           (r'(?:DOB|Date\s*of\s*Birth)\s*:?\s*([^\n]+)', "identity"),
+        "age":           (r'Age\s*:?\s*(\d+)', "identity"),
+
+        # Contact
+        "mobile":        (r'(?:Mobile|Phone|Contact)\s*:?\s*(\+?[\d\s\(\)\-]{8,})', "contact"),
+        "alt_mobile":    (r'(?:Alternate|Alt)\s*(?:Mobile|Phone)\s*:?\s*(\+?[\d\s\(\)\-]{8,})', "contact"),
+        "email":         (r'Email\s*:?\s*([^\s\n]+@[^\s\n]+)', "contact"),
+        "country":       (r'Country\s*:?\s*([^\n]+)', "contact"),
+        "state":         (r'State\s*:?\s*([^\n]+)', "contact"),
+        "city":          (r'City\s*:?\s*([^\n]+)', "contact"),
+        "pincode":       (r'(?:Pin\s*code|Pincode|PIN)\s*:?\s*(\d{6})', "contact"),
+
+        # Documents
+        "aadhaar":       (r'Aadhaar(?:\s*Number)?\s*:?\s*(\d{12})', "documents"),
+        "pan":           (r'PAN(?:\s*Number)?\s*:?\s*([A-Z]{5}\d{4}[A-Z])', "documents"),
+        "voter_id":      (r'(?:Voter|EPIC)\s*(?:ID)?\s*:?\s*([A-Z]{3}\d{7})', "documents"),
+        "dl":            (r'(?:DL|Driving\s*License)\s*:?\s*([A-Z0-9\-]{10,20})', "documents"),
+        "passport":      (r'Passport\s*:?\s*([A-Z][0-9]{7})', "documents"),
+
+        # Location
+        "address":       (r'Address\s*:?\s*([^\n]+(?:\n[^\n]+)*?)(?=\n[━━🗄🔥]|\n[A-Z][a-z]+\s*:|$)', "location"),
+        "district":      (r'District\s*:?\s*([^\n]+)', "location"),
+
+        # Social
+        "instagram":     (r'Instagram\s*:?\s*@?([A-Za-z0-9_.]{3,})', "social"),
+        "facebook":      (r'Facebook\s*:?\s*@?([A-Za-z0-9_.]{3,})', "social"),
+        "twitter":       (r'(?:Twitter|X)\s*:?\s*@?([A-Za-z0-9_]{3,})', "social"),
+        "github":        (r'GitHub\s*:?\s*@?([A-Za-z0-9\-]{3,})', "social"),
+        "snapchat":      (r'Snapchat\s*:?\s*@?([A-Za-z0-9_.]{3,})', "social"),
+
+        # Finance
+        "upi":           (r'UPI(?:\s*ID)?\s*:?\s*([^\s\n]+@[^\s\n]+)', "finance"),
+        "bank":          (r'Bank(?:\s*Name)?\s*:?\s*([^\n]+)', "finance"),
+        "ifsc":          (r'IFSC\s*:?\s*([A-Z]{4}0[A-Z0-9]{6})', "finance"),
+        "account":       (r'(?:Account|A/C)\s*(?:Number)?\s*:?\s*(\d{9,18})', "finance"),
+
+        # Vehicle
+        "vehicle":       (r'(?:Vehicle|RC)\s*(?:Number)?\s*:?\s*([A-Z]{2}\d{1,2}[A-Z]{1,2}\d{4})', "vehicle"),
+        "vehicle_model": (r'Vehicle\s*Model\s*:?\s*([^\n]+)', "vehicle"),
+
+        # Other / source
+        "source":        (r'(?:Source)\s*:?\s*([^\n]+)', "other"),
+        "ip":            (r'\b((?:\d{1,3}\.){3}\d{1,3})\b', "other"),
+    }
+
+    for key, (pat, section) in fields.items():
+        m = re.search(pat, raw_text, re.IGNORECASE)
         if m:
-            val = m.group(1).strip()
-            if val and val.lower() not in ("not available", "n/a", "none"):
-                parsed[key] = val
+            val = clean_val(m.group(1))
+            if val:
+                data["sections"][section][key] = val
 
-    result["parsed"] = parsed
-
-    # Embedded JSON extraction (agar bot ne JSON bheja)
-    json_match = re.search(r'\{[\s\S]*\}', raw_text)
+    # ---------- Embedded JSON extraction ----------
+    # Try to find any JSON blob inside raw (bot might return JSON)
+    json_match = re.search(r'\{[\s\S]{20,}\}', raw_text)
     if json_match:
         try:
-            result["json"] = json.loads(json_match.group(0))
-        except:
+            embedded = json.loads(json_match.group(0))
+            data["embedded_json"] = embedded
+        except Exception:
             pass
 
-    return result
+    # ---------- Auto-classify remaining lines ----------
+    # Any "Key: Value" line not already parsed → "other" section
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        # Skip separator lines
+        if re.match(r'^[━─=\-_]{3,}$', line):
+            continue
+        # "Key : Value" pattern
+        m = re.match(r'^([A-Za-z][A-Za-z0-9 _/\-]{1,40})\s*:\s*(.+)$', line)
+        if not m:
+            continue
+        k = m.group(1).strip().lower().replace(" ", "_")
+        v = clean_val(m.group(2))
+        if not v:
+            continue
+        # Skip if key already exists somewhere in sections
+        already = False
+        for sec in data["sections"].values():
+            if k in sec:
+                already = True
+                break
+        if not already:
+            data["sections"]["other"][k] = v
+
+    # ---------- Remove empty sections ----------
+    data["sections"] = {k: v for k, v in data["sections"].items() if v}
+
+    # ---------- Flat view ----------
+    flat = {}
+    for sec_name, sec_data in data["sections"].items():
+        for k, v in sec_data.items():
+            flat[k] = v
+    data["flat"] = flat
+
+    return data
 
 
-# ================= HTML HOMEPAGE =================
+# ================= HTML =================
 HOMEPAGE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -331,7 +435,7 @@ body{background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);color:#e2e8f0;mi
 .container{max-width:1100px;margin:0 auto}
 header{text-align:center;padding:40px 20px 30px;border-bottom:1px solid #334155;margin-bottom:30px}
 header h1{font-size:2.5rem;background:linear-gradient(90deg,#38bdf8,#818cf8,#c084fc);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:10px}
-header p{color:#94a3b8;font-size:1rem}
+header p{color:#94a3b8}
 .status{display:inline-block;margin-top:15px;padding:6px 16px;border-radius:20px;background:#064e3b;color:#6ee7b7;font-size:0.85rem;border:1px solid #10b981}
 h2{color:#38bdf8;margin:30px 0 15px;font-size:1.4rem;border-left:4px solid #38bdf8;padding-left:12px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:15px}
@@ -353,13 +457,11 @@ footer{text-align:center;padding:30px 0;color:#64748b;font-size:0.85rem;border-t
 <div class="status">● API Online</div>
 </header>
 <div class="note">
-💡 <b>Tip:</b> Add <code>&amp;hidden=true</code> to get only Telegram ID, Name, Mobile, Country.
+💡 <b>Tip:</b> Add <code>&amp;hidden=true</code> to hide raw + only structured data.
 </div>
 <h2>📋 Endpoints</h2>
 <div class="grid" id="endpoints"></div>
-<footer>
-<p>Base URL: <code id="baseurl"></code></p>
-</footer>
+<footer><p>Base URL: <code id="baseurl"></code></p></footer>
 </div>
 <script>
 document.getElementById('baseurl').textContent = window.location.origin;
@@ -409,7 +511,7 @@ endpoints.forEach(e => {
 """
 
 
-# ================= FLASK ROUTES =================
+# ================= ROUTES =================
 @app.route('/')
 def home():
     return render_template_string(HOMEPAGE)
@@ -435,57 +537,60 @@ def dynamic_command(full_path):
         target_chat = BOT_USERNAME
         command_path = full_path.replace("bot&", "", 1)
 
-    # Stats special case
     if command_path == "stats":
         command, value = "stats", ""
     else:
         if "=" not in command_path:
-            return jsonify({"error": "Invalid format. Use /command=value"}), 400
+            return jsonify({"success": False, "error": "Invalid format. Use /command=value"}), 400
         command, value = command_path.split("=", 1)
 
     if command not in valid_commands:
-        return jsonify({"error": f"Invalid command '{command}'", "available": valid_commands}), 400
+        return jsonify({
+            "success": False,
+            "error": f"Invalid command '{command}'",
+            "available": valid_commands
+        }), 400
 
     if telethon_loop is None or not telethon_loop.is_running():
-        return jsonify({"error": "Telethon not connected"}), 500
+        return jsonify({"success": False, "error": "Telethon not connected"}), 500
 
     full_command = f"/{command} {value}".strip()
 
     future = asyncio.run_coroutine_threadsafe(
-        fetch_bot_data(full_command, target_chat, timeout=45),
+        fetch_bot_data(full_command, target_chat, timeout=90),
         telethon_loop
     )
     try:
-        raw_result = future.result(timeout=55)
+        fetched = future.result(timeout=100)
     except TimeoutError:
-        return jsonify({"error": "Request Timeout"}), 504
+        return jsonify({"success": False, "error": "Request Timeout"}), 504
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"success": False, "error": str(e)}), 500
 
-    if raw_result.startswith("Error") or raw_result.startswith("Timeout"):
-        return jsonify({"error": raw_result}), 400
+    if "error" in fetched:
+        return jsonify({
+            "success": False,
+            "command": full_command,
+            "error": fetched["error"]
+        }), 400
 
-    # Parse result
+    raw_result = fetched["text"]
     parsed = parse_osint_result(raw_result)
 
+    # ---------- Base response ----------
     response = {
+        "success": True,
         "command": full_command,
         "target": "Group" if target_chat == GROUP_ID else "Bot",
-        "status": "success"
+        "fallback_used": fetched.get("fallback", False),
+        "data": parsed["sections"],   # nested structured data
+        "flat": parsed["flat"],       # flat key->value map
     }
 
-    if hidden_only:
-        hidden_keys = ["telegram_id", "name", "mobile", "country"]
-        response["hidden_info"] = {
-            k: parsed["parsed"].get(k, "Not Available")
-            for k in hidden_keys
-        }
-    else:
-        # Full response: parsed + raw text
-        response["data"] = parsed["parsed"] if parsed["parsed"] else {}
-        if "json" in parsed:
-            response["data"] = parsed["json"]
+    if not hidden_only:
         response["raw"] = raw_result
+        if "embedded_json" in parsed:
+            response["embedded_json"] = parsed["embedded_json"]
 
     return jsonify(response)
 
@@ -493,6 +598,7 @@ def dynamic_command(full_path):
 @app.route('/health')
 def health():
     return jsonify({
+        "success": True,
         "status": "ok",
         "bot": BOT_USERNAME,
         "telethon_connected": telethon_loop is not None and telethon_loop.is_running(),
@@ -502,16 +608,15 @@ def health():
 
 @app.route('/debug_tg=<path:target>')
 def debug_tg(target):
-    """Debug: exact bot reply dikhata hai."""
     if not target.startswith('@') and not target.isdigit():
         target = '@' + target
     if telethon_loop is None or not telethon_loop.is_running():
-        return jsonify({"error": "Telethon not running"}), 500
+        return jsonify({"success": False, "error": "Telethon not running"}), 500
     future = asyncio.run_coroutine_threadsafe(_debug_fetch(target), telethon_loop)
     try:
-        return jsonify(future.result(timeout=60))
+        return jsonify(future.result(timeout=90))
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 async def _debug_fetch(target):
@@ -524,7 +629,7 @@ async def _debug_fetch(target):
             logs.append({"step": "resolve", "ok": True, "id": bot_entity.id})
         except Exception as e:
             logs.append({"step": "resolve", "ok": False, "error": str(e)})
-            return {"logs": logs}
+            return {"success": False, "logs": logs}
 
         sent = await client.send_message(bot_entity, f"/tg {target}")
         logs.append({"step": "send", "ok": True, "msg_id": sent.id})
@@ -532,25 +637,32 @@ async def _debug_fetch(target):
         received = []
         start = time.time()
 
-        @client.on(events.NewMessage(chats=bot_entity.id))
+        @client.on(events.NewMessage())
         async def handler(event):
             text = event.message.text or ""
+            if event.message.out or not text:
+                return
+            try:
+                sender = await event.get_sender()
+                if not sender or getattr(sender, "id", None) != bot_entity.id:
+                    return
+            except Exception:
+                return
             received.append({
                 "id": event.message.id,
-                "out": event.message.out,
                 "len": len(text),
-                "preview": text[:250],
+                "preview": text[:300],
                 "is_processing": is_processing_message(text),
                 "is_final": is_final_result(text)
             })
 
-        while time.time() - start < 20:
+        while time.time() - start < 60:
             await asyncio.sleep(0.5)
 
         client.remove_event_handler(handler)
-        return {"logs": logs, "received": received, "count": len(received)}
+        return {"success": True, "logs": logs, "received": received, "count": len(received)}
     except Exception as e:
-        return {"logs": logs, "error": str(e)}
+        return {"success": False, "logs": logs, "error": str(e)}
 
 
 # ================= TELETHON THREAD =================
@@ -587,7 +699,7 @@ def start_telethon():
             print("❌ ERROR: Session invalid!")
             return
         me = telethon_loop.run_until_complete(client.get_me())
-        print(f"✅ Telethon Connected as: {me.first_name} (@{me.username})")
+        print(f"✅ Connected as: {me.first_name} (@{me.username})")
         telethon_loop.run_forever()
     except Exception as e:
         print(f"❌ Telethon Start Error: {e}")
