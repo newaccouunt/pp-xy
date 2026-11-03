@@ -174,14 +174,23 @@ async def fetch_bot_data(full_command, target_chat, timeout=30):
     except Exception as e:
         return {"error": str(e)}
 
-# ================= CLEAN JSON PARSER =================
+# ================= CLEAN JSON PARSER (UPGRADED) =================
 def clean_val(v):
     if not v: return None
     v = v.strip()
+    
+    # 1. Remove Markdown backticks and asterisks
+    v = v.replace('`', '').replace('*', '').strip()
+    
+    # 2. Remove Emojis (Standard + Custom/Flags)
     v = re.sub(r'[\U00010000-\U0010FFFF]', '', v) 
     v = re.sub(r'[\U0001F1E6-\U0001F1FF\u2600-\u27BF\uD83C-\uDBFF\uDC00-\uDFFF]', '', v) 
-    v = re.sub(r'\s{2,}', ' ', v).strip()
-    v = re.sub(r'\(\s*\)', '', v).strip()
+    
+    # 3. Remove trailing/leading brackets and spaces left by removed emojis
+    v = re.sub(r'\(\s*\)', '', v) # Empty brackets
+    v = re.sub(r'\s{2,}', ' ', v) # Multiple spaces
+    v = v.strip(' ()-,') # Remove stray brackets, commas, dashes from ends
+    
     if v.lower() in ("not available", "n/a", "none", "null", "-", ""): return None
     return v
 
@@ -206,7 +215,8 @@ def parse_osint_result(raw_text: str, hide_meta: bool = True) -> dict:
         return result
 
     fields = {
-        "telegram_id":   (r'(?:Telegram\s*ID|ᴛᴇʟᴇɢraᴍ\s*ɪᴅ)\s*:?\s*(\d+)', "telegram"),
+        # Upgraded regex for Telegram ID (handles backticks)
+        "telegram_id":   (r'(?:Telegram\s*ID|ᴛᴇʟᴇɢraᴍ\s*ɪᴅ)\s*:?\s*`?(\d+)`?', "telegram"),
         "username":      (r'Username\s*:?\s*@?([A-Za-z0-9_]{3,})', "telegram"),
         "name":          (r'(?<!Telegram )(?<!Father )Name\s*:?\s*([^\n]+)', "identity"),
         "father_name":   (r'(?:Father(?:\'s)?\s*Name|पिता)\s*:?\s*([^\n]+)', "identity"),
@@ -214,7 +224,8 @@ def parse_osint_result(raw_text: str, hide_meta: bool = True) -> dict:
         "gender":        (r'Gender\s*:?\s*([^\n]+)', "identity"),
         "dob":           (r'(?:DOB|Date\s*of\s*Birth)\s*:?\s*([^\n]+)', "identity"),
         "age":           (r'Age\s*:?\s*(\d+)', "identity"),
-        "mobile":        (r'(?:Mobile|Phone|Contact)\s*:?\s*(\+?[\d\s\(\)\-]{8,})', "contact"),
+        # Upgraded regex for Mobile (handles brackets and spaces perfectly)
+        "mobile":        (r'(?:Mobile|Phone|Contact)\s*:?\s*(?:\+?[\d\s\(\)\-]{8,})', "contact"),
         "alt_mobile":    (r'(?:Alternate|Alt)\s*(?:Mobile|Phone)\s*:?\s*(\+?[\d\s\(\)\-]{8,})', "contact"),
         "email":         (r'Email\s*:?\s*([^\s\n]+@[^\s\n]+)', "contact"),
         "country":       (r'Country\s*:?\s*([^\n]+)', "contact"),
@@ -240,14 +251,26 @@ def parse_osint_result(raw_text: str, hide_meta: bool = True) -> dict:
     for key, (pat, section) in fields.items():
         m = re.search(pat, raw_text, re.IGNORECASE)
         if m:
-            val = clean_val(m.group(1))
-            if val: result["sections"][section][key] = val
+            # Mobile ke liye alag logic taaki sirf number aaye, India na aaye
+            if key == "mobile":
+                raw_val = m.group(0)
+                # Extract only the number part
+                num_match = re.search(r'(\+?\d[\d\s\-]{8,})', raw_val)
+                val = clean_val(num_match.group(1)) if num_match else clean_val(m.group(1))
+            else:
+                val = clean_val(m.group(1))
+                
+            if val: 
+                result["sections"][section][key] = val
 
+    # Fallback parsing for lines that might have been missed
     for line in raw_text.splitlines():
         line = line.strip()
         if not line or ":" not in line or should_skip_line(line): continue
+        
         m = re.match(r'^([A-Za-z][A-Za-z0-9 _/\-]{1,40})\s*:\s*(.+)$', line)
         if not m: continue
+        
         k = m.group(1).strip().lower().replace(" ", "_").replace("-", "_")
         v = clean_val(m.group(2))
         
@@ -257,11 +280,17 @@ def parse_osint_result(raw_text: str, hide_meta: bool = True) -> dict:
         already = any(k in sec for sec in result["sections"].values())
         if not already: result["sections"]["other"][k] = v
 
+    # Remove empty sections
     result["sections"] = {k: v for k, v in result["sections"].items() if v}
+    
+    # Create Flat dictionary
     flat = {}
-    for sec_data in result["sections"].values(): flat.update(sec_data)
+    for sec_data in result["sections"].values(): 
+        flat.update(sec_data)
     result["flat"] = flat
+    
     return result
+
 
 # ================= HTML =================
 HOMEPAGE = """
@@ -357,9 +386,18 @@ endpoints.forEach(e => {
 def home():
     return render_template_string(HOMEPAGE)
 
+# Set this to False if you want to see the full technical response by default
+ALWAYS_CLEAN = True 
+
 @app.route('/<path:full_path>')
 def dynamic_command(full_path):
     valid_commands = ['num', 'tg', 'aadhaar', 'adharfamily', 'email', 'name', 'advanced', 'leak', 'upi', 'ifsc', 'pantogst', 'pincode', 'ip', 'vehicle', 'ff', 'bgmi', 'insta', 'github', 'snap', 'paytm', 'basic', 'imei', 'tgid', 'bomb', 'pk', 'stats']
+    
+    # Check for clean query parameter
+    is_clean = request.args.get('clean', 'false').lower() in ('true', '1', 'yes')
+    if ALWAYS_CLEAN:
+        is_clean = True
+        
     hidden_only = request.args.get('hidden', 'false').lower() in ('true', '1', 'yes')
     target_chat = BOT_USERNAME
     command_path = full_path
@@ -398,15 +436,25 @@ def dynamic_command(full_path):
         return jsonify({"success": False, "command": full_command, "error": fetched["error"]}), 400
 
     parsed = parse_osint_result(fetched["text"], hide_meta=True)
-    response = {
-        "success": True,
-        "command": full_command,
-        "data": parsed["sections"],
-        "flat": parsed["flat"]
-    }
-
-    if not hidden_only:
-        response["raw"] = fetched["text"]
+    
+    # If user requests clean output, hide the command, flat, and raw sections
+    if is_clean:
+        response = {
+            "success": True,
+            "data": parsed["sections"]
+        }
+        # Optionally flatten the sections if you want just one flat dictionary
+        # response = {"success": True, "data": parsed["flat"]}
+    else:
+        # Default/Technical output
+        response = {
+            "success": True,
+            "command": full_command,
+            "data": parsed["sections"],
+            "flat": parsed["flat"]
+        }
+        if not hidden_only:
+            response["raw"] = fetched["text"]
 
     return jsonify(response)
 
