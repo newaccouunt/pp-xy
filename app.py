@@ -27,6 +27,10 @@ except ValueError:
 client = None
 telethon_loop = None
 active_proxy = None
+bot_entity_id = None
+
+# ================= GLOBAL STATE FOR LISTENER =================
+pending_requests = {}  # {message_id: {"event": asyncio.Event(), "text": None, "done": False}}
 
 # ================= PROXY =================
 PROXY_SOURCES = [
@@ -133,61 +137,76 @@ def is_final_result(text: str) -> bool:
         return True
     return False
 
+# ================= GLOBAL BOT LISTENER =================
+async def global_bot_listener(event):
+    global bot_entity_id
+    if not event.message or event.message.out:
+        return
+    
+    text = event.message.text or ""
+    if not text:
+        return
+
+    # Verify the sender is the bot
+    try:
+        sender = await event.get_sender()
+        if not sender or getattr(sender, "id", None) != bot_entity_id:
+            return
+    except Exception:
+        return
+
+    # Check if this is a response to any of our pending requests
+    # We use the reply_to_msg_id or just match the most recent pending request
+    for req_id, data in list(pending_requests.items()):
+        if data["done"]:
+            continue
+        
+        # If it's a processing message, we ignore it and keep waiting
+        if is_processing_message(text):
+            continue
+            
+        if is_final_result(text):
+            data["text"] = text
+            data["done"] = True
+            data["event"].set()
+            break # Stop checking other pending requests
+
 # ================= FAST FETCH =================
 async def fetch_bot_data(full_command, target_chat, timeout=30):
+    global bot_entity_id
     try:
         if not client.is_connected():
             await client.connect()
 
         try:
             entity = await client.get_entity(target_chat)
+            bot_entity_id = entity.id
         except Exception as e:
             return {"error": f"Cannot resolve '{target_chat}': {e}"}
 
-        chat_id = entity.id
-        entity_id = entity.id
-        result_event = asyncio.Event()
-        final_text = [None]
-        send_time = [None]
+        # Create a unique ID for this request
+        req_id = str(time.time()) + "_" + str(random.randint(1000, 9999))
+        pending_requests[req_id] = {
+            "event": asyncio.Event(),
+            "text": None,
+            "done": False
+        }
 
-        @client.on(events.NewMessage())
-        async def handler(event):
-            if event.message.out or final_text[0]: return
-            text = event.message.text or ""
-            if not text: return
-
-            chat_match = (event.chat_id == chat_id) or (event.chat_id == -chat_id)
-            sender_match = False
-            try:
-                sender = await event.get_sender()
-                if sender and getattr(sender, "id", None) == entity_id: sender_match = True
-            except Exception: pass
-
-            if not (chat_match or sender_match): return
-
-            if send_time[0] and event.message.date:
-                try:
-                    if event.message.date.timestamp() < send_time[0] - 2: return
-                except Exception: pass
-
-            if is_final_result(text):
-                final_text[0] = text
-                result_event.set()
-            elif is_processing_message(text):
-                pass # Processing, wait for final
-
+        # Send the command
         sent_msg = await client.send_message(entity, full_command)
-        try: send_time[0] = sent_msg.date.timestamp()
-        except Exception: send_time[0] = time.time()
-
+        
+        # Wait for the global listener to catch the reply
         try:
-            await asyncio.wait_for(result_event.wait(), timeout=timeout)
+            await asyncio.wait_for(pending_requests[req_id]["event"].wait(), timeout=timeout)
         except asyncio.TimeoutError:
             pass
 
-        client.remove_event_handler(handler)
-
-        if final_text[0]: return {"text": final_text[0], "success": True}
+        # Cleanup
+        req_data = pending_requests.pop(req_id, None)
+        
+        if req_data and req_data["text"]:
+            return {"text": req_data["text"], "success": True}
+        
         return {"error": f"Timeout: No final result in {timeout}s"}
 
     except Exception as e:
@@ -199,9 +218,8 @@ def clean_val(v):
     v = v.strip()
     
     # 1. Remove Standard and Premium Custom Emojis / Flags
-    # Isme flags, custom telegram emojis, aur standard emojis sab clean ho jayenge
-    v = re.sub(r'[\U00010000-\U0010FFFF]', '', v) # Remove supplementary plane (Custom/premium emojis)
-    v = re.sub(r'[\U0001F1E6-\U0001F1FF\u2600-\u27BF\uD83C-\uDBFF\uDC00-\uDFFF]', '', v) # Standard emojis/flags
+    v = re.sub(r'[\U00010000-\U0010FFFF]', '', v) 
+    v = re.sub(r'[\U0001F1E6-\U0001F1FF\u2600-\u27BF\uD83C-\uDBFF\uDC00-\uDFFF]', '', v) 
     
     # 2. Remove weird spaces and replace with single space
     v = re.sub(r'\s{2,}', ' ', v).strip()
@@ -443,7 +461,7 @@ def health():
 
 # ================= TELETHON THREAD =================
 def start_telethon():
-    global telethon_loop, client
+    global telethon_loop, client, bot_entity_id
     telethon_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(telethon_loop)
 
@@ -463,7 +481,13 @@ def start_telethon():
     try:
         telethon_loop.run_until_complete(client.connect())
         if not telethon_loop.run_until_complete(client.is_user_authorized()):
+            print("❌ User not authorized. Check SESSION_STRING.")
             return
+            
+        # Register the global listener ONCE at startup
+        client.add_event_handler(global_bot_listener, events.NewMessage())
+        print("✅ Global Bot Listener Registered.")
+
         telethon_loop.run_forever()
     except Exception as e:
         print(f"❌ Telethon Start Error: {e}")
@@ -472,5 +496,5 @@ if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     t = threading.Thread(target=start_telethon, daemon=True)
     t.start()
-    time.sleep(10)
+    time.sleep(5) # Reduced from 10s, 5s is enough for proxy test
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
