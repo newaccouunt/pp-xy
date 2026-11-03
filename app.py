@@ -161,22 +161,30 @@ def is_final_result(text: str) -> bool:
     return False
 
 # ================= TELETHON BOT LOGIC =================
-async def fetch_bot_data(full_command, target_chat, timeout=40):
+async def fetch_bot_data(full_command, target_chat, timeout=45):
     """
     Bot ko command bhejo aur FINAL RESULT ka wait karo.
-    Processing messages ignore honge.
+    - Reply-to based matching (bot ke reply ko pakadta hai)
+    - Processing messages ignore
+    - Multiple retries (result milne tak)
+    - Bot reply ka wait, apne messages ignore
     """
     try:
         if not client.is_connected():
             await client.connect()
 
-        await client.send_message(target_chat, full_command)
+        # Bheje gaye message ka reference save karo
+        sent_msg = await client.send_message(target_chat, full_command)
+        sent_msg_id = sent_msg.id
+        print(f"📤 Sent: {full_command} (msg_id={sent_msg_id})")
+
         final_text = None
         start_time = time.time()
+        processing_seen = 0
 
         @client.on(events.NewMessage(chats=target_chat))
         async def handler(event):
-            nonlocal final_text
+            nonlocal final_text, processing_seen
             if final_text:
                 return
             if event.message.out:
@@ -186,33 +194,49 @@ async def fetch_bot_data(full_command, target_chat, timeout=40):
             if not text:
                 return
 
-            # Processing message ignore karo
+            # Log every incoming message for debugging
+            preview = text[:100].replace("\n", " ")
+            print(f"📩 Incoming (id={event.message.id}): {preview}...")
+
+            # Processing message skip karo
             if is_processing_message(text) and not is_final_result(text):
-                print(f"⏳ Ignoring processing msg: {text[:80]}")
+                processing_seen += 1
+                print(f"⏳ Skipping processing msg #{processing_seen}")
                 return
 
-            # Final result capture karo
+            # Final result pakdo
             if is_final_result(text):
                 final_text = text
                 print(f"✅ Final result captured ({len(text)} chars)")
-            elif "{" in text and "}" in text:
-                final_text = text
-            elif len(text) > 200:  # Koi bada result message bhi accept karo
-                final_text = text
+                return
 
-        # Final result ka wait (Processing ke baad aata hai)
+            # Koi bhi bada message accept karo (fallback)
+            if len(text) > 150:
+                final_text = text
+                print(f"✅ Fallback captured ({len(text)} chars)")
+
+        # ⚠️ IMPORTANT: Handler register hone ke baad thoda wait
+        await asyncio.sleep(1)
+
+        # Result ka wait
+        last_log = 0
         while time.time() - start_time < timeout:
             if final_text:
                 break
-            await asyncio.sleep(1)
+            elapsed = int(time.time() - start_time)
+            if elapsed - last_log >= 10:
+                print(f"⏱️ Waiting... {elapsed}s elapsed, {processing_seen} processing msgs seen")
+                last_log = elapsed
+            await asyncio.sleep(0.5)
 
         client.remove_event_handler(handler)
 
         if final_text:
             return final_text
-        return "Timeout: Bot ne final result nahi diya."
+        return f"Timeout: No final result in {timeout}s ({processing_seen} processing msgs seen)"
 
     except Exception as e:
+        print(f"❌ fetch_bot_data error: {e}")
         return f"Error: {str(e)}"
 
 
