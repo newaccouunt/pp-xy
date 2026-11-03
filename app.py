@@ -42,60 +42,42 @@ PROXY_SOURCES = [
     "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
 ]
 
-
 async def fetch_source(session, url, result_set):
     try:
         timeout = aiohttp.ClientTimeout(total=4)
-        async with session.get(url, timeout=timeout, ssl=False,
-                               headers={"User-Agent": "Mozilla/5.0"}) as resp:
-            if resp.status != 200:
-                return
+        async with session.get(url, timeout=timeout, ssl=False, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+            if resp.status != 200: return
             text = await resp.text(errors='ignore')
             if '<html' in text.lower() or '<body' in text.lower():
-                for m in re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}:\d+\b', text):
-                    result_set.add(m)
+                for m in re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}:\d+\b', text): result_set.add(m)
             else:
                 if text.strip().startswith('{') or text.strip().startswith('['):
                     try:
                         data = json.loads(text)
                         if isinstance(data, list):
                             for item in data:
-                                if isinstance(item, str):
-                                    result_set.add(item)
+                                if isinstance(item, str): result_set.add(item)
                         elif isinstance(data, dict):
                             for key in ['proxy', 'proxies', 'data']:
                                 if key in data:
-                                    if isinstance(data[key], str):
-                                        result_set.add(data[key])
+                                    if isinstance(data[key], str): result_set.add(data[key])
                                     elif isinstance(data[key], list):
                                         for x in data[key]:
-                                            if isinstance(x, str):
-                                                result_set.add(x)
-                    except:
-                        pass
+                                            if isinstance(x, str): result_set.add(x)
+                    except: pass
                 else:
                     for line in text.split('\n'):
                         line = line.strip()
-                        if ':' in line:
-                            result_set.add(line)
-    except:
-        pass
-
+                        if ':' in line: result_set.add(line)
+    except: pass
 
 async def test_single_proxy(session, proxy):
     try:
         timeout = aiohttp.ClientTimeout(total=3)
         connector = aiohttp.TCPConnector(ssl=False)
-        async with session.get(
-            "https://api.telegram.org",
-            proxy=f"http://{proxy}",
-            timeout=timeout,
-            connector=connector
-        ) as resp:
+        async with session.get("https://api.telegram.org", proxy=f"http://{proxy}", timeout=timeout, connector=connector) as resp:
             return resp.status < 500
-    except:
-        return False
-
+    except: return False
 
 async def fetch_and_test_proxies():
     global active_proxy
@@ -107,15 +89,11 @@ async def fetch_and_test_proxies():
 
     valid = []
     for p in raw_proxies:
-        p = p.strip()
-        match = re.match(r'^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)$', p)
-        if match:
-            valid.append(f"{match.group(1)}:{match.group(2)}")
+        match = re.match(r'^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)$', p.strip())
+        if match: valid.append(f"{match.group(1)}:{match.group(2)}")
     valid = list(set(valid))
-    print(f"📦 Total unique proxies: {len(valid)}")
 
-    if not valid:
-        return None
+    if not valid: return None
 
     async with aiohttp.ClientSession() as session:
         chunk = valid[:100]
@@ -126,12 +104,9 @@ async def fetch_and_test_proxies():
         active_proxy = random.choice(working)
         print(f"✅ Working proxy: {active_proxy}")
         return active_proxy
-    print("❌ No working proxy found, connecting direct...")
     return None
 
-
 # ================= FAST RESULT DETECTION =================
-# Final result ke strong markers (yeh sirf result message mein aate hain)
 FINAL_MARKERS = [
     "QXA OSINT RESULT",
     "USER DETAILS",
@@ -139,53 +114,27 @@ FINAL_MARKERS = [
     "Telegram ID :",
 ]
 
-# Processing detection (sirf pehla line check — bahut strict)
 def is_processing_message(text: str) -> bool:
-    if not text:
-        return True
-    # Agar final marker hai -> processing NAHI
-    if any(m in text for m in FINAL_MARKERS):
-        return False
-    stripped = text.strip()
-    # Sirf processing ka first line check karo
-    first_line = stripped.split("\n", 1)[0].strip()
-    # Exact "⏳ Processing..." ya "Processing..." 
-    if re.match(r'^[⏳⏱🔄]*\s*Processing', first_line, re.IGNORECASE):
-        return True
-    # Chhota message + "please wait"/"fetching"
-    if len(stripped) < 150:
-        if re.search(r'(please wait|fetching|searching|loading)', stripped, re.IGNORECASE):
-            return True
+    if not text: return True
+    if any(m in text for m in FINAL_MARKERS): return False
+    first_line = text.strip().split("\n", 1)[0].strip()
+    if re.match(r'^[⏳⏱🔄]*\s*Processing', first_line, re.IGNORECASE): return True
+    if len(text) < 150 and re.search(r'(please wait|fetching|searching|loading)', text, re.IGNORECASE): return True
     return False
-
 
 def is_final_result(text: str) -> bool:
-    if not text:
-        return False
-    # Primary: strong marker
-    if any(m in text for m in FINAL_MARKERS):
-        return True
-    # Fallback: processing nahi + lamba message
+    if not text: return False
+    if any(m in text for m in FINAL_MARKERS): return True
     if len(text) > 200 and not is_processing_message(text):
         low = text.lower()
-        if "usage:" in low and len(text) < 400:
-            return False
-        if "will self-destruct" in low and len(text) < 400:
-            return False
-        if "invalid" in low and len(text) < 400:
-            return False
+        if "usage:" in low and len(text) < 400: return False
+        if "will self-destruct" in low and len(text) < 400: return False
+        if "invalid" in low and len(text) < 400: return False
         return True
     return False
-
 
 # ================= FAST FETCH =================
 async def fetch_bot_data(full_command, target_chat, timeout=30):
-    """
-    FAST fetch:
-    - Handler send se PEHLE register
-    - Pehli final message pe turant return (usually 3-5s)
-    - Timeout sirf safety ke liye (30s)
-    """
     try:
         if not client.is_connected():
             await client.connect()
@@ -197,157 +146,101 @@ async def fetch_bot_data(full_command, target_chat, timeout=30):
 
         chat_id = entity.id
         entity_id = entity.id
-        print(f"✅ Resolved '{target_chat}' -> id={chat_id}")
-
         result_event = asyncio.Event()
         final_text = [None]
         send_time = [None]
 
-        # ✅ Handler PEHLE register (race khatam)
         @client.on(events.NewMessage())
         async def handler(event):
-            if event.message.out:
-                return
-            if final_text[0]:  # already got result
-                return
-
+            if event.message.out or final_text[0]: return
             text = event.message.text or ""
-            if not text:
-                return
+            if not text: return
 
-            # Match chat ya sender
             chat_match = (event.chat_id == chat_id) or (event.chat_id == -chat_id)
             sender_match = False
             try:
                 sender = await event.get_sender()
-                if sender and getattr(sender, "id", None) == entity_id:
-                    sender_match = True
-            except Exception:
-                pass
-            if not (chat_match or sender_match):
-                return
+                if sender and getattr(sender, "id", None) == entity_id: sender_match = True
+            except Exception: pass
 
-            # Ignore purane messages
+            if not (chat_match or sender_match): return
+
             if send_time[0] and event.message.date:
                 try:
-                    if event.message.date.timestamp() < send_time[0] - 2:
-                        return
-                except Exception:
-                    pass
-
-            preview = text[:100].replace("\n", " ")
-            print(f"📩 Incoming (id={event.message.id}, len={len(text)}): {preview}")
+                    if event.message.date.timestamp() < send_time[0] - 2: return
+                except Exception: pass
 
             if is_final_result(text):
                 final_text[0] = text
-                print(f"✅ Final captured ({len(text)} chars) — returning NOW")
                 result_event.set()
             elif is_processing_message(text):
-                print("⏳ Processing — waiting for final")
+                pass # Processing, wait for final
 
-        # ✅ Send command
         sent_msg = await client.send_message(entity, full_command)
-        try:
-            send_time[0] = sent_msg.date.timestamp()
-        except Exception:
-            send_time[0] = time.time()
-        print(f"📤 Sent '{full_command}' (msg_id={sent_msg.id})")
+        try: send_time[0] = sent_msg.date.timestamp()
+        except Exception: send_time[0] = time.time()
 
-        # ✅ Wait for event — jaise hi final aaye turant return
         try:
             await asyncio.wait_for(result_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
-            print(f"⏱️ Timeout {timeout}s — no final result")
+            pass
 
         client.remove_event_handler(handler)
 
-        if final_text[0]:
-            return {"text": final_text[0], "success": True}
-
+        if final_text[0]: return {"text": final_text[0], "success": True}
         return {"error": f"Timeout: No final result in {timeout}s"}
 
     except Exception as e:
-        print(f"❌ fetch_bot_data error: {e}")
-        import traceback
-        traceback.print_exc()
         return {"error": str(e)}
 
-
-# ================= CLEAN JSON PARSER (Hide Source) =================
+# ================= CLEAN JSON PARSER (Premium Emoji Fix) =================
 def clean_val(v):
-    if not v:
-        return None
+    if not v: return None
     v = v.strip()
-    # Emoji/flag strip
-    v = re.sub(r'[\U0001F1E6-\U0001F1FF\u2600-\u27BF\uD83C-\uDBFF\uDC00-\uDFFF]+', '', v).strip()
+    
+    # 1. Remove Standard and Premium Custom Emojis / Flags
+    # Isme flags, custom telegram emojis, aur standard emojis sab clean ho jayenge
+    v = re.sub(r'[\U00010000-\U0010FFFF]', '', v) # Remove supplementary plane (Custom/premium emojis)
+    v = re.sub(r'[\U0001F1E6-\U0001F1FF\u2600-\u27BF\uD83C-\uDBFF\uDC00-\uDFFF]', '', v) # Standard emojis/flags
+    
+    # 2. Remove weird spaces and replace with single space
     v = re.sub(r'\s{2,}', ' ', v).strip()
-    if v.lower() in ("not available", "n/a", "none", "null", "-", ""):
-        return None
+    
+    # 3. Remove brackets if any left empty e.g. "()"
+    v = re.sub(r'\(\s*\)', '', v).strip()
+    
+    if v.lower() in ("not available", "n/a", "none", "null", "-", ""): return None
     return v
 
-
-# Keys jinko API response mein show NAHI karna (hide source & branding)
-HIDDEN_KEYS = {
-    "source", "powered_by", "powered by qxa", "powered by qxa team",
-    "database", "qxa database", "source_", "_source",
-}
-
-# Lines jinko skip karna (branding, separators)
+HIDDEN_KEYS = {"source", "powered_by", "powered by qxa", "powered by qxa team", "database", "qxa database"}
 SKIP_LINE_PATTERNS = [
     r'^━+$', r'^─+$', r'^=+$', r'^-+$',
     r'powered\s*by', r'qxa\s*team', r'qxa\s*database',
-    r'^source\s*:', r'^database\s*:',
-    r'qxa\s*osint\s*result',
-    r'✈️\s*telegram\s*lookup',
-    r'👤\s*user\s*details',
-    r'🗄️',
-    r'🔥\s*powered',
+    r'^source\s*:', r'^database\s:', r'qxa\s*osint\s*result',
+    r'✈️\s*telegram\s*lookup', r'👤\s*user\s*details', r'🗄️', r'🔥\s*powered',
 ]
-
 
 def should_skip_line(line: str) -> bool:
     low = line.strip().lower()
     for pat in SKIP_LINE_PATTERNS:
-        if re.search(pat, low):
-            return True
+        if re.search(pat, low): return True
     return False
 
-
 def parse_osint_result(raw_text: str, hide_meta: bool = True) -> dict:
-    """
-    Clean structured JSON — source/branding hidden.
-    """
-    result = {
-        "success": True,
-        "sections": {
-            "telegram": {},
-            "identity": {},
-            "contact": {},
-            "documents": {},
-            "location": {},
-            "social": {},
-            "finance": {},
-            "vehicle": {},
-            "other": {}
-        }
-    }
-
+    result = {"success": True, "sections": {"telegram": {}, "identity": {}, "contact": {}, "documents": {}, "location": {}, "social": {}, "finance": {}, "vehicle": {}, "other": {}}}
     if not raw_text:
         result["success"] = False
         return result
 
-    # ---------- Field regex ----------
     fields = {
         "telegram_id":   (r'(?:Telegram\s*ID|ᴛᴇʟᴇɢraᴍ\s*ɪᴅ)\s*:?\s*(\d+)', "telegram"),
         "username":      (r'Username\s*:?\s*@?([A-Za-z0-9_]{3,})', "telegram"),
-
         "name":          (r'(?<!Telegram )(?<!Father )Name\s*:?\s*([^\n]+)', "identity"),
         "father_name":   (r'(?:Father(?:\'s)?\s*Name|पिता)\s*:?\s*([^\n]+)', "identity"),
         "mother_name":   (r'(?:Mother(?:\'s)?\s*Name|माता)\s*:?\s*([^\n]+)', "identity"),
         "gender":        (r'Gender\s*:?\s*([^\n]+)', "identity"),
         "dob":           (r'(?:DOB|Date\s*of\s*Birth)\s*:?\s*([^\n]+)', "identity"),
         "age":           (r'Age\s*:?\s*(\d+)', "identity"),
-
         "mobile":        (r'(?:Mobile|Phone|Contact)\s*:?\s*(\+?[\d\s\(\)\-]{8,})', "contact"),
         "alt_mobile":    (r'(?:Alternate|Alt)\s*(?:Mobile|Phone)\s*:?\s*(\+?[\d\s\(\)\-]{8,})', "contact"),
         "email":         (r'Email\s*:?\s*([^\s\n]+@[^\s\n]+)', "contact"),
@@ -355,24 +248,19 @@ def parse_osint_result(raw_text: str, hide_meta: bool = True) -> dict:
         "state":         (r'State\s*:?\s*([^\n]+)', "contact"),
         "city":          (r'City\s*:?\s*([^\n]+)', "contact"),
         "pincode":       (r'(?:Pin\s*code|Pincode|PIN)\s*:?\s*(\d{6})', "contact"),
-
         "aadhaar":       (r'Aadhaar(?:\s*Number)?\s*:?\s*(\d{12})', "documents"),
         "pan":           (r'PAN(?:\s*Number)?\s*:?\s*([A-Z]{5}\d{4}[A-Z])', "documents"),
         "voter_id":      (r'(?:Voter|EPIC)\s*(?:ID)?\s*:?\s*([A-Z]{3}\d{7})', "documents"),
         "dl":            (r'(?:DL|Driving\s*License)\s*:?\s*([A-Z0-9\-]{10,20})', "documents"),
-
         "address":       (r'Address\s*:?\s*([^\n]+(?:\n[^\n]+)*?)(?=\n[━🗄🔥]|\n[A-Z][a-z]+\s*:|$)', "location"),
         "district":      (r'District\s*:?\s*([^\n]+)', "location"),
-
         "instagram":     (r'Instagram\s*:?\s*@?([A-Za-z0-9_.]{3,})', "social"),
         "facebook":      (r'Facebook\s*:?\s*@?([A-Za-z0-9_.]{3,})', "social"),
         "twitter":       (r'(?:Twitter|X)\s*:?\s*@?([A-Za-z0-9_]{3,})', "social"),
         "github":        (r'GitHub\s*:?\s*@?([A-Za-z0-9\-]{3,})', "social"),
-
         "upi":           (r'UPI(?:\s*ID)?\s*:?\s*([^\s\n]+@[^\s\n]+)', "finance"),
         "bank":          (r'Bank(?:\s*Name)?\s*:?\s*([^\n]+)', "finance"),
         "ifsc":          (r'IFSC\s*:?\s*([A-Z]{4}0[A-Z0-9]{6})', "finance"),
-
         "vehicle":       (r'(?:Vehicle|RC)\s*(?:Number)?\s*:?\s*([A-Z]{2}\d{1,2}[A-Z]{1,2}\d{4})', "vehicle"),
     }
 
@@ -380,52 +268,27 @@ def parse_osint_result(raw_text: str, hide_meta: bool = True) -> dict:
         m = re.search(pat, raw_text, re.IGNORECASE)
         if m:
             val = clean_val(m.group(1))
-            if val:
-                result["sections"][section][key] = val
+            if val: result["sections"][section][key] = val
 
-    # ---------- Remaining "Key: Value" lines (skip source/branding) ----------
     for line in raw_text.splitlines():
         line = line.strip()
-        if not line or ":" not in line:
-            continue
-        if should_skip_line(line):
-            continue
-
+        if not line or ":" not in line or should_skip_line(line): continue
         m = re.match(r'^([A-Za-z][A-Za-z0-9 _/\-]{1,40})\s*:\s*(.+)$', line)
-        if not m:
-            continue
-
-        raw_key = m.group(1).strip()
-        k = raw_key.lower().replace(" ", "_").replace("-", "_")
+        if not m: continue
+        k = m.group(1).strip().lower().replace(" ", "_").replace("-", "_")
         v = clean_val(m.group(2))
+        
+        if not v or k in HIDDEN_KEYS: continue
+        if hide_meta and ("source" in k or "powered" in k or k == "database"): continue
+        
+        already = any(k in sec for sec in result["sections"].values())
+        if not already: result["sections"]["other"][k] = v
 
-        if not v:
-            continue
-        if k in HIDDEN_KEYS:
-            continue
-        if hide_meta and ("source" in k or "powered" in k or k == "database"):
-            continue
-
-        # Skip if already captured
-        already = False
-        for sec in result["sections"].values():
-            if k in sec:
-                already = True
-                break
-        if not already:
-            result["sections"]["other"][k] = v
-
-    # ---------- Clean empty sections ----------
     result["sections"] = {k: v for k, v in result["sections"].items() if v}
-
-    # ---------- Flat view ----------
     flat = {}
-    for sec_data in result["sections"].values():
-        flat.update(sec_data)
+    for sec_data in result["sections"].values(): flat.update(sec_data)
     result["flat"] = flat
-
     return result
-
 
 # ================= HTML =================
 HOMEPAGE = """
@@ -516,22 +379,14 @@ endpoints.forEach(e => {
 </html>
 """
 
-
 # ================= ROUTES =================
 @app.route('/')
 def home():
     return render_template_string(HOMEPAGE)
 
-
 @app.route('/<path:full_path>')
 def dynamic_command(full_path):
-    valid_commands = [
-        'num', 'tg', 'aadhaar', 'adharfamily', 'email', 'name',
-        'advanced', 'leak', 'upi', 'ifsc', 'pantogst', 'pincode',
-        'ip', 'vehicle', 'ff', 'bgmi', 'insta', 'github', 'snap',
-        'paytm', 'basic', 'imei', 'tgid', 'bomb', 'pk', 'stats'
-    ]
-
+    valid_commands = ['num', 'tg', 'aadhaar', 'adharfamily', 'email', 'name', 'advanced', 'leak', 'upi', 'ifsc', 'pantogst', 'pincode', 'ip', 'vehicle', 'ff', 'bgmi', 'insta', 'github', 'snap', 'paytm', 'basic', 'imei', 'tgid', 'bomb', 'pk', 'stats']
     hidden_only = request.args.get('hidden', 'false').lower() in ('true', '1', 'yes')
     target_chat = BOT_USERNAME
     command_path = full_path
@@ -551,22 +406,14 @@ def dynamic_command(full_path):
         command, value = command_path.split("=", 1)
 
     if command not in valid_commands:
-        return jsonify({
-            "success": False,
-            "error": f"Invalid command '{command}'",
-            "available": valid_commands
-        }), 400
+        return jsonify({"success": False, "error": f"Invalid command '{command}'", "available": valid_commands}), 400
 
     if telethon_loop is None or not telethon_loop.is_running():
         return jsonify({"success": False, "error": "Telethon not connected"}), 500
 
     full_command = f"/{command} {value}".strip()
 
-    # ✅ 30s timeout (bot normally 3-5s mein reply deta hai)
-    future = asyncio.run_coroutine_threadsafe(
-        fetch_bot_data(full_command, target_chat, timeout=30),
-        telethon_loop
-    )
+    future = asyncio.run_coroutine_threadsafe(fetch_bot_data(full_command, target_chat, timeout=30), telethon_loop)
     try:
         fetched = future.result(timeout=35)
     except TimeoutError:
@@ -575,97 +422,24 @@ def dynamic_command(full_path):
         return jsonify({"success": False, "error": str(e)}), 500
 
     if "error" in fetched:
-        return jsonify({
-            "success": False,
-            "command": full_command,
-            "error": fetched["error"]
-        }), 400
+        return jsonify({"success": False, "command": full_command, "error": fetched["error"]}), 400
 
-    raw_result = fetched["text"]
-    parsed = parse_osint_result(raw_result, hide_meta=True)
-
-    # ✅ Clean response (source/branding hidden)
+    parsed = parse_osint_result(fetched["text"], hide_meta=True)
     response = {
         "success": True,
         "command": full_command,
         "data": parsed["sections"],
-        "flat": parsed["flat"],
+        "flat": parsed["flat"]
     }
 
-    # Raw sirf hidden=false pe
     if not hidden_only:
-        response["raw"] = raw_result
+        response["raw"] = fetched["text"]
 
     return jsonify(response)
 
-
 @app.route('/health')
 def health():
-    return jsonify({
-        "success": True,
-        "status": "ok",
-        "telethon_connected": telethon_loop is not None and telethon_loop.is_running(),
-    })
-
-
-@app.route('/debug_tg=<path:target>')
-def debug_tg(target):
-    if not target.startswith('@') and not target.isdigit():
-        target = '@' + target
-    if telethon_loop is None or not telethon_loop.is_running():
-        return jsonify({"success": False, "error": "Telethon not running"}), 500
-    future = asyncio.run_coroutine_threadsafe(_debug_fetch(target), telethon_loop)
-    try:
-        return jsonify(future.result(timeout=40))
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-async def _debug_fetch(target):
-    logs = []
-    try:
-        if not client.is_connected():
-            await client.connect()
-        bot_entity = await client.get_entity(BOT_USERNAME)
-        logs.append({"step": "resolve", "ok": True, "id": bot_entity.id})
-
-        sent = await client.send_message(bot_entity, f"/tg {target}")
-        logs.append({"step": "send", "ok": True, "msg_id": sent.id})
-
-        received = []
-        start = time.time()
-
-        @client.on(events.NewMessage())
-        async def handler(event):
-            text = event.message.text or ""
-            if event.message.out or not text:
-                return
-            try:
-                sender = await event.get_sender()
-                if not sender or getattr(sender, "id", None) != bot_entity.id:
-                    return
-            except Exception:
-                return
-            received.append({
-                "id": event.message.id,
-                "len": len(text),
-                "preview": text[:300],
-                "is_processing": is_processing_message(text),
-                "is_final": is_final_result(text),
-                "elapsed_s": round(time.time() - start, 2)
-            })
-
-        while time.time() - start < 20:
-            # Early exit if final received
-            if any(r["is_final"] for r in received):
-                break
-            await asyncio.sleep(0.3)
-
-        client.remove_event_handler(handler)
-        return {"success": True, "logs": logs, "received": received, "count": len(received)}
-    except Exception as e:
-        return {"success": False, "logs": logs, "error": str(e)}
-
+    return jsonify({"success": True, "status": "ok", "telethon_connected": telethon_loop is not None and telethon_loop.is_running()})
 
 # ================= TELETHON THREAD =================
 def start_telethon():
@@ -678,39 +452,25 @@ def start_telethon():
     if proxy_str:
         from python_socks.async_.asyncio import Proxy
         host, port = proxy_str.split(':')
-
         async def connector(ip, tport):
             proxy = Proxy.from_url(f"http://{host}:{port}")
             sock = await proxy.connect(dest_host=ip, dest_port=tport)
             return await asyncio.open_connection(sock=sock)
-
-        client = TelegramClient(
-            StringSession(SESSION_STRING), API_ID, API_HASH,
-            connection=None,
-            auto_reconnect=True
-        )
-        print(f"🔗 Using proxy: {proxy_str}")
+        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, connection=None, auto_reconnect=True)
     else:
-        print("⚠️ No proxy, connecting directly...")
         client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
     try:
-        print("Telethon connecting...")
         telethon_loop.run_until_complete(client.connect())
         if not telethon_loop.run_until_complete(client.is_user_authorized()):
-            print("❌ ERROR: Session invalid!")
             return
-        me = telethon_loop.run_until_complete(client.get_me())
-        print(f"✅ Connected as: {me.first_name} (@{me.username})")
         telethon_loop.run_forever()
     except Exception as e:
         print(f"❌ Telethon Start Error: {e}")
-
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     t = threading.Thread(target=start_telethon, daemon=True)
     t.start()
     time.sleep(10)
-    print(f"🚀 Flask running on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
